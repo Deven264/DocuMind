@@ -32,6 +32,59 @@ function App() {
   const [chatMessages, setChatMessages] = useState<{role: string, content: string, citations?: any[]}[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [isChatting, setIsChatting] = useState(false);
+  const [chatSessions, setChatSessions] = useState<any[]>([]);
+  const [currentSessionId, setCurrentSessionId] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (activeTab === 'chat') {
+      fetchChatSessions();
+    }
+  }, [activeTab]);
+
+  const fetchChatSessions = async () => {
+    try {
+      const res = await fetch('http://localhost:8000/api/chats');
+      if (res.ok) {
+        const data = await res.json();
+        setChatSessions(data);
+      }
+    } catch (e) { console.error(e); }
+  };
+
+  const createNewChat = async () => {
+    try {
+      const res = await fetch('http://localhost:8000/api/chats', { method: 'POST' });
+      if (res.ok) {
+        const session = await res.json();
+        setChatSessions(prev => [session, ...prev]);
+        setCurrentSessionId(session.id);
+        setChatMessages([]);
+      }
+    } catch (e) { console.error(e); }
+  };
+
+  const loadChatSession = async (id: number) => {
+    setCurrentSessionId(id);
+    try {
+      const res = await fetch(`http://localhost:8000/api/chats/${id}`);
+      if (res.ok) {
+        const data = await res.json();
+        setChatMessages(data);
+      }
+    } catch (e) { console.error(e); }
+  };
+
+  const deleteChatSession = async (e: React.MouseEvent, id: number) => {
+    e.stopPropagation();
+    try {
+      await fetch(`http://localhost:8000/api/chats/${id}`, { method: 'DELETE' });
+      setChatSessions(prev => prev.filter(s => s.id !== id));
+      if (currentSessionId === id) {
+        setCurrentSessionId(null);
+        setChatMessages([]);
+      }
+    } catch (e) { console.error(e); }
+  };
 
   const fetchHistory = async () => {
     setLoadingHistory(true);
@@ -56,6 +109,25 @@ function App() {
   const handleSendMessage = async () => {
     if (!chatInput.trim()) return;
     
+    let activeSessionId = currentSessionId;
+    if (!activeSessionId) {
+      // Create a new session automatically if none exists
+      try {
+        const res = await fetch('http://localhost:8000/api/chats', { method: 'POST' });
+        if (res.ok) {
+          const session = await res.json();
+          setChatSessions(prev => [session, ...prev]);
+          setCurrentSessionId(session.id);
+          activeSessionId = session.id;
+        } else {
+            throw new Error("Could not create session");
+        }
+      } catch (e) {
+          alert("Failed to initialize chat session.");
+          return;
+      }
+    }
+    
     const newMsg = { role: 'user', content: chatInput };
     const updatedMessages = [...chatMessages, newMsg];
     
@@ -67,7 +139,7 @@ function App() {
       const res = await fetch('http://localhost:8000/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: updatedMessages })
+        body: JSON.stringify({ session_id: activeSessionId, messages: updatedMessages })
       });
       
       if (!res.ok) throw new Error('Chat failed');
@@ -78,6 +150,11 @@ function App() {
         content: data.reply,
         citations: data.citations 
       }]);
+      
+      // Auto-refresh sessions after the first message so the sidebar gets the new auto-generated title
+      if (updatedMessages.length === 1) {
+          setTimeout(fetchChatSessions, 4000); // Give the background task some time to finish
+      }
       
     } catch (err) {
       setChatMessages(prev => [...prev, { role: 'assistant', content: 'Connection Error: Failed to reach DocuMind AI.' }]);
@@ -313,82 +390,132 @@ function App() {
         )}
 
         {activeTab === 'chat' && (
-          <div className="glass-panel" style={{ height: 'calc(100vh - 180px)', display: 'flex', flexDirection: 'column', padding: '0' }}>
-            <div style={{ flex: 1, padding: '24px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '20px' }}>
-              {chatMessages.length === 0 && (
-                <div style={{ textAlign: 'center', color: 'var(--text-muted)', marginTop: '40px' }}>
-                  <Icons.Chat />
-                  <h3>How can I help you?</h3>
-                  <p>Try asking: "Find me the resume of the Python developer" or "Show me invoices over $4000"</p>
-                </div>
-              )}
-              {chatMessages.map((msg, i) => (
-                <div key={i} style={{ 
-                  alignSelf: msg.role === 'user' ? 'flex-end' : 'flex-start',
-                  background: msg.role === 'user' ? 'var(--accent-color)' : 'rgba(255,255,255,0.05)',
-                  border: msg.role === 'user' ? 'none' : '1px solid var(--panel-border)',
-                  padding: '14px 18px',
-                  borderRadius: '12px',
-                  maxWidth: '75%',
-                  lineHeight: '1.5'
-                }}>
-                  <div style={{ fontSize: '14px' }}>{msg.content}</div>
-                  {msg.citations && msg.citations.length > 0 && (
-                    <div style={{ marginTop: '12px', paddingTop: '12px', borderTop: '1px solid rgba(255,255,255,0.1)' }}>
-                      <span style={{ fontSize: '11px', textTransform: 'uppercase', color: 'var(--text-muted)' }}>Citations Found:</span>
-                      <div style={{ display: 'flex', gap: '8px', marginTop: '6px', flexWrap: 'wrap' }}>
-                        {msg.citations.map((cite, j) => (
-                          <div 
-                            key={j} 
-                            onClick={() => {
-                              setActiveDoc(cite);
-                              setDocType(cite.document_type);
-                              setExtractedData(cite.extracted);
-                              setActiveTab('search');
-                            }}
-                            style={{ 
-                              background: 'rgba(99, 102, 241, 0.2)', border: '1px solid var(--accent-color)', 
-                              padding: '4px 8px', borderRadius: '4px', fontSize: '11px', cursor: 'pointer',
-                              display: 'flex', alignItems: 'center', gap: '4px'
-                            }}
-                          >
-                            <Icons.Document /> {cite.filename}
-                          </div>
-                        ))}
+          <div className="repository-container" style={{ gridTemplateColumns: '260px 1fr', height: 'calc(100vh - 180px)', gap: '20px' }}>
+            {/* Sidebar for Chat Sessions */}
+            <div className="glass-panel" style={{ padding: '16px', display: 'flex', flexDirection: 'column', gap: '16px', overflowY: 'auto' }}>
+              <button 
+                onClick={createNewChat}
+                className="btn" 
+                style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}
+              >
+                <span>+</span> New Chat
+              </button>
+              
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '10px' }}>
+                <span style={{ fontSize: '11px', textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: '4px' }}>Recent</span>
+                {chatSessions.length === 0 ? (
+                    <div style={{ color: 'var(--text-muted)', fontSize: '13px', textAlign: 'center', marginTop: '20px' }}>No history</div>
+                ) : (
+                    chatSessions.map(session => (
+                      <div 
+                        key={session.id}
+                        onClick={() => loadChatSession(session.id)}
+                        style={{
+                          padding: '12px',
+                          borderRadius: '8px',
+                          background: currentSessionId === session.id ? 'rgba(99, 102, 241, 0.2)' : 'rgba(0,0,0,0.2)',
+                          border: currentSessionId === session.id ? '1px solid var(--accent-color)' : '1px solid transparent',
+                          cursor: 'pointer',
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          alignItems: 'center',
+                          transition: 'all 0.2s ease'
+                        }}
+                      >
+                        <div style={{ fontSize: '13px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flex: 1 }}>
+                          {session.title || 'New Chat'}
+                        </div>
+                        <button 
+                          onClick={(e) => deleteChatSession(e, session.id)}
+                          style={{ background: 'none', border: 'none', color: 'var(--danger)', cursor: 'pointer', opacity: 0.7 }}
+                          title="Delete Chat"
+                        >
+                          ✕
+                        </button>
                       </div>
-                    </div>
-                  )}
-                </div>
-              ))}
-              {isChatting && (
-                <div style={{ alignSelf: 'flex-start', color: 'var(--text-muted)', fontSize: '13px' }}>
-                  Thinking...
-                </div>
-              )}
+                    ))
+                )}
+              </div>
             </div>
-            
-            <div style={{ padding: '16px', background: 'rgba(0,0,0,0.3)', borderTop: '1px solid var(--panel-border)' }}>
-              <div style={{ display: 'flex', gap: '10px' }}>
-                <input 
-                  type="text" 
-                  value={chatInput}
-                  onChange={(e) => setChatInput(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
-                  placeholder="Ask your Document Vault..."
-                  disabled={isChatting}
-                  style={{
-                    flex: 1, padding: '12px 16px', borderRadius: '8px', border: '1px solid var(--panel-border)',
-                    background: 'rgba(255,255,255,0.05)', color: '#fff', outline: 'none', fontSize: '14px'
-                  }}
-                />
-                <button 
-                  onClick={handleSendMessage} 
-                  disabled={isChatting || !chatInput.trim()}
-                  className="btn" 
-                  style={{ padding: '0 24px' }}
-                >
-                  Send
-                </button>
+
+            {/* Chat Area */}
+            <div className="glass-panel" style={{ display: 'flex', flexDirection: 'column', padding: '0', overflow: 'hidden' }}>
+              <div style={{ flex: 1, padding: '24px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '20px' }}>
+                {chatMessages.length === 0 && (
+                  <div style={{ textAlign: 'center', color: 'var(--text-muted)', marginTop: '40px' }}>
+                    <Icons.Chat />
+                    <h3>How can I help you?</h3>
+                    <p>Try asking: "Find me the resume of the Python developer" or "Show me invoices over $4000"</p>
+                  </div>
+                )}
+                {chatMessages.map((msg, i) => (
+                  <div key={i} style={{ 
+                    alignSelf: msg.role === 'user' ? 'flex-end' : 'flex-start',
+                    background: msg.role === 'user' ? 'var(--accent-color)' : 'rgba(255,255,255,0.05)',
+                    border: msg.role === 'user' ? 'none' : '1px solid var(--panel-border)',
+                    padding: '14px 18px',
+                    borderRadius: '12px',
+                    maxWidth: '75%',
+                    lineHeight: '1.5'
+                  }}>
+                    <div style={{ fontSize: '14px' }}>{msg.content}</div>
+                    {msg.citations && msg.citations.length > 0 && (
+                      <div style={{ marginTop: '12px', paddingTop: '12px', borderTop: '1px solid rgba(255,255,255,0.1)' }}>
+                        <span style={{ fontSize: '11px', textTransform: 'uppercase', color: 'var(--text-muted)' }}>Citations Found:</span>
+                        <div style={{ display: 'flex', gap: '8px', marginTop: '6px', flexWrap: 'wrap' }}>
+                          {msg.citations.map((cite, j) => (
+                            <div 
+                              key={j} 
+                              onClick={() => {
+                                setActiveDoc(cite);
+                                setDocType(cite.document_type);
+                                setExtractedData(cite.extracted);
+                                setActiveTab('search');
+                              }}
+                              style={{ 
+                                background: 'rgba(99, 102, 241, 0.2)', border: '1px solid var(--accent-color)', 
+                                padding: '4px 8px', borderRadius: '4px', fontSize: '11px', cursor: 'pointer',
+                                display: 'flex', alignItems: 'center', gap: '4px'
+                              }}
+                            >
+                              <Icons.Document /> {cite.filename}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ))}
+                {isChatting && (
+                  <div style={{ alignSelf: 'flex-start', color: 'var(--text-muted)', fontSize: '13px' }}>
+                    Thinking...
+                  </div>
+                )}
+              </div>
+              
+              <div style={{ padding: '16px', background: 'rgba(0,0,0,0.3)', borderTop: '1px solid var(--panel-border)' }}>
+                <div style={{ display: 'flex', gap: '10px' }}>
+                  <input 
+                    type="text" 
+                    value={chatInput}
+                    onChange={(e) => setChatInput(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
+                    placeholder="Ask your Document Vault..."
+                    disabled={isChatting}
+                    style={{
+                      flex: 1, padding: '12px 16px', borderRadius: '8px', border: '1px solid var(--panel-border)',
+                      background: 'rgba(255,255,255,0.05)', color: '#fff', outline: 'none', fontSize: '14px'
+                    }}
+                  />
+                  <button 
+                    onClick={handleSendMessage} 
+                    disabled={isChatting || !chatInput.trim()}
+                    className="btn" 
+                    style={{ padding: '0 24px' }}
+                  >
+                    Send
+                  </button>
+                </div>
               </div>
             </div>
           </div>

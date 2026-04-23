@@ -8,13 +8,13 @@ import json
 import os
 import uuid
 import chromadb
-from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, Body
+from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, Body, BackgroundTasks
 from pydantic import BaseModel
-from typing import List, Dict
+from typing import List, Dict, Optional
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
-from database import SessionLocal, Document
+from database import SessionLocal, Document, ChatSession, ChatMessage
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -305,25 +305,99 @@ def list_documents(db: Session = Depends(get_db)):
     ]
 
 # ─────────────────────────────────────────────────────────────────
+# Chat Sessions CRUD
+# ─────────────────────────────────────────────────────────────────
+
+@app.get("/api/chats")
+def get_chats(db: Session = Depends(get_db)):
+    sessions = db.query(ChatSession).order_by(ChatSession.created_at.desc()).all()
+    return [{"id": s.id, "title": s.title, "created_at": s.created_at.isoformat()} for s in sessions]
+
+@app.post("/api/chats")
+def create_chat(db: Session = Depends(get_db)):
+    session = ChatSession(title="New Chat")
+    db.add(session)
+    db.commit()
+    db.refresh(session)
+    return {"id": session.id, "title": session.title}
+
+@app.get("/api/chats/{session_id}")
+def get_chat_messages(session_id: int, db: Session = Depends(get_db)):
+    msgs = db.query(ChatMessage).filter(ChatMessage.session_id == session_id).order_by(ChatMessage.created_at.asc()).all()
+    return [
+        {
+            "id": m.id,
+            "role": m.role,
+            "content": m.content,
+            "citations": m.citations_json
+        } for m in msgs
+    ]
+
+@app.delete("/api/chats/{session_id}")
+def delete_chat(session_id: int, db: Session = Depends(get_db)):
+    session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
+    if session:
+        db.delete(session)
+        db.commit()
+    return {"status": "ok"}
+
+def auto_name_session(session_id: int, user_message: str):
+    db = SessionLocal()
+    try:
+        response = ai_session.post('http://127.0.0.1:11434/api/chat', json={
+            "model": "qwen2.5:0.5b",
+            "messages": [
+                {"role": "system", "content": "You are a title generator. Generate a very short 3-word title for the user's message. Do not use quotes or punctuation. Just return the raw words."},
+                {"role": "user", "content": user_message}
+            ],
+            "stream": False
+        }, timeout=20)
+        
+        if response.status_code == 200:
+            title = response.json().get('message', {}).get('content', 'New Chat').strip()
+            title = title.replace('"', '').replace("'", "")
+            
+            chat_session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
+            if chat_session:
+                chat_session.title = title[:40]
+                db.commit()
+    except Exception as e:
+        print(f"Auto-naming failed: {e}")
+    finally:
+        db.close()
+
+
+# ─────────────────────────────────────────────────────────────────
 # RAG Chat Endpoint (Conversational Search)
 # ─────────────────────────────────────────────────────────────────
-class ChatMessage(BaseModel):
+class InboundMessage(BaseModel):
     role: str
     content: str
 
 class ChatPayload(BaseModel):
-    messages: List[ChatMessage]
+    session_id: int
+    messages: List[InboundMessage]
 
 @app.post("/api/chat")
-def chat_with_documents(payload: ChatPayload, db: Session = Depends(get_db)):
+def chat_with_documents(payload: ChatPayload, bg_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     if not payload.messages:
         raise HTTPException(status_code=400, detail="No messages provided")
         
+    session_id = payload.session_id
     user_query = payload.messages[-1].content
+    
+    # Check if this is the very first message for auto-naming
+    existing_count = db.query(ChatMessage).filter(ChatMessage.session_id == session_id).count()
+    if existing_count == 0:
+        bg_tasks.add_task(auto_name_session, session_id, user_query)
+        
+    # Save the User message to DB
+    user_db_msg = ChatMessage(session_id=session_id, role="user", content=user_query)
+    db.add(user_db_msg)
+    db.commit()
     
     # 1. Context Retrieval
     context_str = ""
-    referenced_ids = []
     
     try:
         embed_res = ai_session.post('http://127.0.0.1:11434/api/embeddings', json={
@@ -343,30 +417,28 @@ def chat_with_documents(payload: ChatPayload, db: Session = Depends(get_db)):
                 docs = db.query(Document).filter(Document.id.in_(doc_ids)).all()
                 for d in docs:
                     context_str += f"\n--- Document ID: {d.id} ---\nFilename: {d.filename}\nType: {d.document_type}\nExtracted: {json.dumps(d.extracted_data)}\n"
-                    referenced_ids.append(d.id)
     except Exception as e:
         print(f"[DocuMind] RAG Vector Retrieval Failed: {e}")
 
     # 2. System Context Injection
-    system_prompt = f"""You are DocuMind Chat, an intelligent document retrieval assistant.
-You help the user find specific documents from their private database.
-Here are the top database records that MIGHT match their query. It is YOUR job to filter them logically based on the user's request.
+    system_prompt = f"""You are DocuMind Chat, an intelligent and highly detailed document retrieval assistant.
+Provide comprehensive and highly detailed answers exactly like ChatGPT would. Elaborate fully on the data you find.
+
+Here are the top database records that MIGHT match their query. It is YOUR job to filter them logically.
 
 <DATABASE_CONTEXT>
 {context_str if context_str else "No documents found."}
 </DATABASE_CONTEXT>
 
-Rules:
-1. If the user asks for a specific value (like "around $5000" or "React Developer"), ONLY mention documents from the context that actually match that value. Ignore the others.
-2. If none of the documents match the specific value, politely say "I couldn't find a document matching that criteria in the database."
-3. Keep your answer brief, conversational, and direct.
-4. When you mention a document, explicitly refer to its Filename or Document ID.
+CRITICAL RULES:
+1. ONLY use documents that actually match what the user is asking. If they ask for $5000, do not use $60000. 
+2. If none of the documents match, say "I couldn't find a document matching that criteria."
+3. VERY IMPORTANT: If you use information from a document, you MUST explicitly cite it by adding `[Citation: X]` at the end of your sentence, where X is the Document ID. (Example: "John is a React developer. [Citation: 4]")
 """
 
-    # 3. Construct Sliding Window History
+    # 3. Construct Sliding Window History (From Payload)
     history = [{"role": "system", "content": system_prompt}]
     
-    # Keep only the last 4 messages to prevent context overflow on the 0.5b model
     recent_msgs = payload.messages[-4:]
     for msg in recent_msgs:
         history.append({"role": msg.role, "content": msg.content})
@@ -382,9 +454,15 @@ Rules:
         
         reply = response.json().get('message', {}).get('content', "I'm having trouble processing that request right now.")
         
-        # Also return the actual document objects so the UI can render them as interactive citations
-        citation_docs = db.query(Document).filter(Document.id.in_(referenced_ids[:3])).all()
-        citations = [
+        # 5. Extract Citations using Regex
+        # Look for [Citation: 12] or similar variations
+        citation_matches = re.findall(r'\[Citation:\s*(\d+)\]', reply, re.IGNORECASE)
+        # Deduplicate and convert to int
+        explicit_doc_ids = list(set([int(x) for x in citation_matches]))
+        
+        # Pull actual citation documents
+        citation_docs = db.query(Document).filter(Document.id.in_(explicit_doc_ids)).all()
+        citations_json = [
             {
                 "id": d.id,
                 "filename": d.filename,
@@ -394,9 +472,17 @@ Rules:
             } for d in citation_docs
         ]
         
+        # Clean the reply to remove the ugly [Citation: X] blocks since the UI renders them below the message
+        clean_reply = re.sub(r'\[Citation:\s*\d+\]', '', reply, flags=re.IGNORECASE).strip()
+        
+        # Save Assistant reply to DB
+        ast_db_msg = ChatMessage(session_id=session_id, role="assistant", content=clean_reply, citations_json=citations_json)
+        db.add(ast_db_msg)
+        db.commit()
+        
         return {
-            "reply": reply,
-            "citations": citations
+            "reply": clean_reply,
+            "citations": citations_json
         }
         
     except Exception as e:

@@ -1,0 +1,17 @@
+node_modules
+dist
+dist-electron
+build
+.env
+.env.*
+.DS_Store
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.db
+uploads/
+
+# Vite
+*.local

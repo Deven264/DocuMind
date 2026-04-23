@@ -11,6 +11,9 @@ const Icons = {
   Search: () => (
     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
   ),
+  Chat: () => (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path></svg>
+  ),
   Settings: () => (
     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
   )
@@ -26,6 +29,9 @@ function App() {
   });
   const [history, setHistory] = useState<any[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
+  const [chatMessages, setChatMessages] = useState<{role: string, content: string, citations?: any[]}[]>([]);
+  const [chatInput, setChatInput] = useState('');
+  const [isChatting, setIsChatting] = useState(false);
 
   const fetchHistory = async () => {
     setLoadingHistory(true);
@@ -44,6 +50,39 @@ function App() {
       console.error('History fetch failed:', err);
     } finally {
       setLoadingHistory(false);
+    }
+  };
+
+  const handleSendMessage = async () => {
+    if (!chatInput.trim()) return;
+    
+    const newMsg = { role: 'user', content: chatInput };
+    const updatedMessages = [...chatMessages, newMsg];
+    
+    setChatMessages(updatedMessages);
+    setChatInput('');
+    setIsChatting(true);
+    
+    try {
+      const res = await fetch('http://localhost:8000/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: updatedMessages })
+      });
+      
+      if (!res.ok) throw new Error('Chat failed');
+      const data = await res.json();
+      
+      setChatMessages(prev => [...prev, { 
+        role: 'assistant', 
+        content: data.reply,
+        citations: data.citations 
+      }]);
+      
+    } catch (err) {
+      setChatMessages(prev => [...prev, { role: 'assistant', content: 'Connection Error: Failed to reach DocuMind AI.' }]);
+    } finally {
+      setIsChatting(false);
     }
   };
 
@@ -129,18 +168,25 @@ function App() {
           >
             <Icons.Search /> Repository
           </div>
+          <div 
+            className={`nav-item ${activeTab === 'chat' ? 'active' : ''}`}
+            onClick={() => setActiveTab('chat')}
+          >
+            <Icons.Chat /> Knowledge Chat
+          </div>
         </nav>
       </aside>
 
       <main className="main-content">
         <header className="header">
           <h1>
-            {activeTab === 'upload' ? 'Upload & Analyze' : 'Document Repository'}
+            {activeTab === 'upload' ? 'Upload & Analyze' : activeTab === 'search' ? 'Document Repository' : 'DocuMind Assistant'}
           </h1>
           <p>
             {activeTab === 'upload' 
               ? 'Drop your business documents here. Local AI will extract key fields autonomously.' 
-              : 'Browse your historical document bank and review extracted intelligence.'}
+              : activeTab === 'search' ? 'Browse your historical document bank and review extracted intelligence.'
+              : 'Chat interactively with your private vault. Ask questions, find documents, and synthesize data.'}
           </p>
         </header>
 
@@ -189,11 +235,11 @@ function App() {
         {activeTab === 'search' && (
           <div className="repository-container" style={{ gridTemplateColumns: activeDoc ? '280px 1fr 350px' : '350px 1fr', height: 'calc(100vh - 180px)' }}>
             <div className="glass-panel" style={{ maxHeight: '70vh', overflowY: 'auto' }}>
-              <h3 style={{ marginBottom: '20px' }}>History</h3>
+              <h3 style={{ marginBottom: '20px' }}>Knowledge Base</h3>
               {loadingHistory ? (
-                <p style={{ color: 'var(--text-muted)' }}>Updating ledger...</p>
+                <p style={{ color: 'var(--text-muted)' }}>Searching Neural Index...</p>
               ) : history.length === 0 ? (
-                <p style={{ color: 'var(--text-muted)' }}>Repository is empty.</p>
+                <p style={{ color: 'var(--text-muted)' }}>No matches found.</p>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                   {history.map((doc) => (
@@ -261,6 +307,88 @@ function App() {
                     </div>
                   </div>
                 ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'chat' && (
+          <div className="glass-panel" style={{ height: 'calc(100vh - 180px)', display: 'flex', flexDirection: 'column', padding: '0' }}>
+            <div style={{ flex: 1, padding: '24px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '20px' }}>
+              {chatMessages.length === 0 && (
+                <div style={{ textAlign: 'center', color: 'var(--text-muted)', marginTop: '40px' }}>
+                  <Icons.Chat />
+                  <h3>How can I help you?</h3>
+                  <p>Try asking: "Find me the resume of the Python developer" or "Show me invoices over $4000"</p>
+                </div>
+              )}
+              {chatMessages.map((msg, i) => (
+                <div key={i} style={{ 
+                  alignSelf: msg.role === 'user' ? 'flex-end' : 'flex-start',
+                  background: msg.role === 'user' ? 'var(--accent-color)' : 'rgba(255,255,255,0.05)',
+                  border: msg.role === 'user' ? 'none' : '1px solid var(--panel-border)',
+                  padding: '14px 18px',
+                  borderRadius: '12px',
+                  maxWidth: '75%',
+                  lineHeight: '1.5'
+                }}>
+                  <div style={{ fontSize: '14px' }}>{msg.content}</div>
+                  {msg.citations && msg.citations.length > 0 && (
+                    <div style={{ marginTop: '12px', paddingTop: '12px', borderTop: '1px solid rgba(255,255,255,0.1)' }}>
+                      <span style={{ fontSize: '11px', textTransform: 'uppercase', color: 'var(--text-muted)' }}>Citations Found:</span>
+                      <div style={{ display: 'flex', gap: '8px', marginTop: '6px', flexWrap: 'wrap' }}>
+                        {msg.citations.map((cite, j) => (
+                          <div 
+                            key={j} 
+                            onClick={() => {
+                              setActiveDoc(cite);
+                              setDocType(cite.document_type);
+                              setExtractedData(cite.extracted);
+                              setActiveTab('search');
+                            }}
+                            style={{ 
+                              background: 'rgba(99, 102, 241, 0.2)', border: '1px solid var(--accent-color)', 
+                              padding: '4px 8px', borderRadius: '4px', fontSize: '11px', cursor: 'pointer',
+                              display: 'flex', alignItems: 'center', gap: '4px'
+                            }}
+                          >
+                            <Icons.Document /> {cite.filename}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ))}
+              {isChatting && (
+                <div style={{ alignSelf: 'flex-start', color: 'var(--text-muted)', fontSize: '13px' }}>
+                  Thinking...
+                </div>
+              )}
+            </div>
+            
+            <div style={{ padding: '16px', background: 'rgba(0,0,0,0.3)', borderTop: '1px solid var(--panel-border)' }}>
+              <div style={{ display: 'flex', gap: '10px' }}>
+                <input 
+                  type="text" 
+                  value={chatInput}
+                  onChange={(e) => setChatInput(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
+                  placeholder="Ask your Document Vault..."
+                  disabled={isChatting}
+                  style={{
+                    flex: 1, padding: '12px 16px', borderRadius: '8px', border: '1px solid var(--panel-border)',
+                    background: 'rgba(255,255,255,0.05)', color: '#fff', outline: 'none', fontSize: '14px'
+                  }}
+                />
+                <button 
+                  onClick={handleSendMessage} 
+                  disabled={isChatting || !chatInput.trim()}
+                  className="btn" 
+                  style={{ padding: '0 24px' }}
+                >
+                  Send
+                </button>
               </div>
             </div>
           </div>

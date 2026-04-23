@@ -7,7 +7,10 @@ import requests
 import json
 import os
 import uuid
-from fastapi import FastAPI, File, UploadFile, Depends, HTTPException
+import chromadb
+from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, Body
+from pydantic import BaseModel
+from typing import List, Dict
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
@@ -22,6 +25,10 @@ app = FastAPI(title="DocuMind Local AI Backend")
 ai_session = requests.Session()
 retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
 ai_session.mount('http://', HTTPAdapter(max_retries=retries))
+
+# Vector Database
+chroma_client = chromadb.PersistentClient(path="./chroma_db")
+vector_collection = chroma_client.get_or_create_collection(name="documind_vectors")
 
 # DB Dependency
 def get_db():
@@ -147,29 +154,25 @@ def extract_entities(text_lines: list) -> tuple[str, dict]:
     # Aggressive truncation for tiny 0.5B model context stability
     truncated_text = full_text[:8000]
 
-    prompt = f"""You are a professional document intelligence engine for business SMEs.
-Output ONLY raw valid JSON — no markdown, no explanation, no extra text.
+    prompt = f"""Extract the key business data from the text below. 
+You must output ONLY valid JSON. Extract specific fields directly from the text. 
+If an important field is found in the text, invent a short English key for it (like "Company Name", "Total Amount", "Email").
 
-Analyze the document text below. Return a JSON object formatted exactly like this example, but replace the keys and values with ALL the relevant data points you find in the underlying text:
+Example Expected Output format:
 {{
-  "document_type": "Resume",
+  "document_type": "Invoice / Resume / Contract [Choose one]",
   "extracted": {{
     "Applicant Name": "Deven Patel",
-    "Email Address": "deven@example.com",
-    "Location": "Noida, UP",
-    "Skills": "Python, React",
-    "Phone Number": "Not found"
+    "Email": "deven@example.com",
+    "Location": "Noida",
+    "Total Billed": "$400"
   }}
 }}
 
-Rules:
-1. The "document_type" should accurately categorize what the document is (e.g. Purchase Order, Resume, Legal Contract, Invoice).
-2. The "extracted" dictionary MUST contain the actual real names of the fields you find. Do NOT output generic keys like "Data Point 1". Make up the best descriptive key possible.
-3. Extract AS MANY relevant fields as possible. Do not limit yourself. If there are 15 important fields in the document, extract all 15.
-4. Every value MUST be a readable string. If an important field is missing, write "Not found".
-
-DOCUMENT TEXT:
+TEXT TO EXTRACT FROM:
 {truncated_text}
+
+OUTPUT JSON ONLY:
 """
 
     try:
@@ -249,6 +252,28 @@ async def upload_document(file: UploadFile = File(...), db: Session = Depends(ge
         db.add(new_doc)
         db.commit()
         db.refresh(new_doc)
+        
+        # ─────────────────────────────────────────────────────────────────
+        # Semantic Indexing using Nomic
+        # ─────────────────────────────────────────────────────────────────
+        full_document_content = " ".join(raw_text)
+        vector_payload = f"Type: {doc_type}. Data: {json.dumps(extracted_data)}. Content: {full_document_content[:4000]}"
+        try:
+            embed_res = ai_session.post('http://127.0.0.1:11434/api/embeddings', json={
+                "model": "nomic-embed-text",
+                "prompt": vector_payload
+            }, timeout=60)
+            if embed_res.status_code == 200:
+                embedding = embed_res.json().get("embedding")
+                vector_collection.add(
+                    embeddings=[embedding],
+                    documents=[vector_payload],
+                    metadatas=[{"filename": file.filename}],
+                    ids=[str(new_doc.id)]
+                )
+        except Exception as e:
+            print(f"[DocuMind] Semantic Embedding failed (Document still saved to SQLite): {e}")
+
     except Exception as e:
         db.rollback()
         # Clean up the dangling file if DB commit bombs out
@@ -279,6 +304,105 @@ def list_documents(db: Session = Depends(get_db)):
         for d in docs
     ]
 
+# ─────────────────────────────────────────────────────────────────
+# RAG Chat Endpoint (Conversational Search)
+# ─────────────────────────────────────────────────────────────────
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class ChatPayload(BaseModel):
+    messages: List[ChatMessage]
+
+@app.post("/api/chat")
+def chat_with_documents(payload: ChatPayload, db: Session = Depends(get_db)):
+    if not payload.messages:
+        raise HTTPException(status_code=400, detail="No messages provided")
+        
+    user_query = payload.messages[-1].content
+    
+    # 1. Context Retrieval
+    context_str = ""
+    referenced_ids = []
+    
+    try:
+        embed_res = ai_session.post('http://127.0.0.1:11434/api/embeddings', json={
+            "model": "nomic-embed-text",
+            "prompt": user_query
+        }, timeout=45)
+        
+        if embed_res.status_code == 200:
+            query_embedding = embed_res.json().get("embedding")
+            results = vector_collection.query(
+                query_embeddings=[query_embedding],
+                n_results=7 # Pull 7 to give LLM plenty to filter logically
+            )
+            
+            if results['ids'] and results['ids'][0]:
+                doc_ids = [int(i) for i in results['ids'][0]]
+                docs = db.query(Document).filter(Document.id.in_(doc_ids)).all()
+                for d in docs:
+                    context_str += f"\n--- Document ID: {d.id} ---\nFilename: {d.filename}\nType: {d.document_type}\nExtracted: {json.dumps(d.extracted_data)}\n"
+                    referenced_ids.append(d.id)
+    except Exception as e:
+        print(f"[DocuMind] RAG Vector Retrieval Failed: {e}")
+
+    # 2. System Context Injection
+    system_prompt = f"""You are DocuMind Chat, an intelligent document retrieval assistant.
+You help the user find specific documents from their private database.
+Here are the top database records that MIGHT match their query. It is YOUR job to filter them logically based on the user's request.
+
+<DATABASE_CONTEXT>
+{context_str if context_str else "No documents found."}
+</DATABASE_CONTEXT>
+
+Rules:
+1. If the user asks for a specific value (like "around $5000" or "React Developer"), ONLY mention documents from the context that actually match that value. Ignore the others.
+2. If none of the documents match the specific value, politely say "I couldn't find a document matching that criteria in the database."
+3. Keep your answer brief, conversational, and direct.
+4. When you mention a document, explicitly refer to its Filename or Document ID.
+"""
+
+    # 3. Construct Sliding Window History
+    history = [{"role": "system", "content": system_prompt}]
+    
+    # Keep only the last 4 messages to prevent context overflow on the 0.5b model
+    recent_msgs = payload.messages[-4:]
+    for msg in recent_msgs:
+        history.append({"role": msg.role, "content": msg.content})
+        
+    # 4. Generate Response
+    try:
+        response = ai_session.post('http://127.0.0.1:11434/api/chat', json={
+            "model": "qwen2.5:0.5b",
+            "messages": history,
+            "stream": False
+        }, timeout=120)
+        response.raise_for_status()
+        
+        reply = response.json().get('message', {}).get('content', "I'm having trouble processing that request right now.")
+        
+        # Also return the actual document objects so the UI can render them as interactive citations
+        citation_docs = db.query(Document).filter(Document.id.in_(referenced_ids[:3])).all()
+        citations = [
+            {
+                "id": d.id,
+                "filename": d.filename,
+                "document_type": d.document_type,
+                "file_path": d.file_path,
+                "extracted": d.extracted_data
+            } for d in citation_docs
+        ]
+        
+        return {
+            "reply": reply,
+            "citations": citations
+        }
+        
+    except Exception as e:
+        print(f"Chat Error: {e}")
+        raise HTTPException(status_code=500, detail=f"AI Engine failed to respond: {str(e)}")
+
 @app.delete("/api/documents/{doc_id}")
 def delete_document(doc_id: int, db: Session = Depends(get_db)):
     doc = db.query(Document).filter(Document.id == doc_id).first()
@@ -287,13 +411,18 @@ def delete_document(doc_id: int, db: Session = Depends(get_db)):
     
     # Try to delete the physical file first
     if doc.file_path:
-        # doc.file_path looks like "/uploads/xxx.pdf", convert to local path
         local_path = doc.file_path.lstrip("/")
         if os.path.exists(local_path):
             try:
                 os.remove(local_path)
             except Exception as e:
                 print(f"File cleanup warning: {e}")
+
+    # Remove from ChromaDB Vector Store
+    try:
+        vector_collection.delete(ids=[str(doc_id)])
+    except Exception as e:
+        pass
 
     # Remove from DB
     db.delete(doc)
